@@ -316,6 +316,62 @@ def bind(side, other, cwd, replace_peer_of=None):
     print(json.dumps({"codex": cid, "claude": aid, "workspace": str(cwd)}, ensure_ascii=False))
 
 
+def create_peer(side, cwd):
+    variable = "CODEX_THREAD_ID" if side == "codex" else "CLAUDE_CODE_SESSION_ID"
+    current = os.environ.get(variable)
+    if not current:
+        raise ValueError(f"请从当前客户端调用，缺少 {variable}。")
+    validate = codex_transcript if side == "codex" else claude_transcript
+    validate(session_id(current), cwd)
+    child_env = os.environ.copy()
+    for key in ("CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"):
+        child_env.pop(key, None)
+
+    peer = None
+    prompt = "初始化 ccxp 配对会话。仅回复「就绪」，不调用工具，不修改文件。"
+    if side == "codex":
+        name = "ccxp-" + uuid.uuid4().hex
+        args = ["claude", "--bg", "--name", name, prompt]
+    else:
+        args = ["codex", "exec", "--json", "--skip-git-repo-check", prompt]
+    try:
+        done = subprocess.run(args, env=child_env, cwd=cwd, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(f"对端启动超时。请先核对已创建的会话再重试。{name if side == 'codex' else ''}") from exc
+    if side == "claude":
+        for line in done.stdout.splitlines():
+            event = json.loads(line)
+            if event.get("type") == "thread.started":
+                peer = session_id(event["thread_id"])
+                break
+    if done.returncode or (side == "claude" and not peer):
+        raise ValueError(f"对端初始化未完成。{peer or ''} {done.stderr.strip()[-400:]}")
+    if side == "codex":
+        # Background startup can return before the target is registered for SendMessage.
+        for _ in range(30):
+            result = subprocess.run(["claude", "agents", "--json"], cwd=cwd, env=child_env,
+                                    capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                matches = [agent for agent in json.loads(result.stdout) if agent.get("name") == name
+                           and Path(agent["cwd"]).resolve() == cwd]
+                if len(matches) == 1:
+                    peer = session_id(matches[0]["sessionId"])
+                    try:
+                        claude_transcript(peer, cwd)
+                    except ValueError:
+                        pass  # The transcript or live PID record may lag the CLI listing.
+                    else:
+                        break
+            time.sleep(0.5)
+        else:
+            raise ValueError(f"Claude Code 尚未在当前工作区就绪。请核对 {name}（{peer or 'ID 待注册'}）再绑定。")
+    try:
+        bind(side, peer, cwd)
+    except (ValueError, OSError, sqlite3.Error) as exc:
+        raise ValueError(f"新会话 {peer} 已创建，绑定失败：{exc}") from exc
+
+
 def original_command(side, digest, *interval):
     command = [sys.executable, str(SCRIPT), "original", "--for", side, digest]
     if interval:
@@ -554,6 +610,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     cmds = parser.add_subparsers(dest="cmd", required=True)
     cmds.add_parser("install")
+    p = cmds.add_parser("create", help="Start a new peer in this workspace and pair it")
+    p.add_argument("--from", dest="side", choices=["codex", "claude"], required=True)
     p = cmds.add_parser("bind")
     p.add_argument("--from", dest="side", choices=["codex", "claude"], required=True)
     p.add_argument("--peer", required=True)
@@ -600,6 +658,11 @@ def main():
     elif args.cmd == "send":
         try:
             print(send(args.side, args.message))
+        except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
+            parser.exit(1, f"{exc}\n")
+    elif args.cmd == "create":
+        try:
+            create_peer(args.side, Path.cwd().resolve())
         except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
             parser.exit(1, f"{exc}\n")
     elif args.cmd == "bind":
